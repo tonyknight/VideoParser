@@ -2,12 +2,13 @@ import os
 import subprocess
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from tqdm import tqdm  # For progress bar
+import ffmpeg 
 # Define the directory containing your media files
-media_dir = "/path/to/your/folder"
-output_file = "media_info.csv"
-scan_mode = "quick"  # Change this to 'extensive' for ffmpeg scan
-max_workers = 4  # Number of parallel threads to use
+media_dir = "/Volumes/Verona/Video"
+output_file = "/Volumes/Verona/VideoDetails.csv"
+max_workers = 12  # Number of parallel threads to use
+
 
 # Function to run shell commands and capture output
 def run_command(command):
@@ -17,7 +18,8 @@ def run_command(command):
     except Exception as e:
         return None
 
-# Function to extract media info
+
+# Function to extract media info using ffmpeg-python
 def extract_media_info(file_path):
     filename = os.path.basename(file_path)
     full_path = os.path.abspath(file_path)
@@ -26,61 +28,68 @@ def extract_media_info(file_path):
     container = file_path.split(".")[-1]
 
     try:
-        if scan_mode == "quick":
-            # Quick scan using ffprobe
-            codec = run_command(f"ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 '{file_path}'")
-            resolution = run_command(f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 '{file_path}'")
-            total_tracks = int(run_command(f"ffprobe -v error -show_entries stream=index -of csv=p=0 '{file_path}' | wc -l"))
-            video_tracks = int(run_command(f"ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 '{file_path}' | wc -l"))
-            audio_tracks = int(run_command(f"ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 '{file_path}' | wc -l"))
-            subtitle_tracks = int(run_command(f"ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 '{file_path}' | wc -l"))
-            chapter_tracks = int(run_command(f"ffprobe -v error -show_entries chapters=index -of csv=p=0 '{file_path}' | wc -l"))
+        # Extract information using ffmpeg-python
+        probe = ffmpeg.probe(file_path)
+        video_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'video']
+        audio_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'audio']
+        subtitle_streams = [stream for stream in probe['streams'] if stream['codec_type'] == 'subtitle']
+
+        if video_streams:
+            codec = video_streams[0]['codec_name']
+            width = video_streams[0].get('width')
+            height = video_streams[0].get('height')
+            resolution = f"{width}x{height}"
         else:
-            # Extensive scan using ffmpeg
-            codec = run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Video:' | sed -n 's/.*, \(.*\) (.*, Video: \(.*\),.*/\\2/p'")
-            resolution = run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Video:' | awk '{{for(i=1;i<=NF;i++){{if($i~/[0-9]{{3,4}}x[0-9]{{3,4}}/){{print $i}}}}}}'")
-            total_tracks = int(run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Stream #' | wc -l"))
-            video_tracks = int(run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Video:' | wc -l"))
-            audio_tracks = int(run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Audio:' | wc -l"))
-            subtitle_tracks = int(run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Subtitle:' | wc -l"))
-            chapter_tracks = int(run_command(f"ffmpeg -i '{file_path}' 2>&1 | grep 'Chapter:' | wc -l"))
-        
-        # Replace h265 or hevc codecs with HEVC
-        if codec in ["hevc", "h265"]:
-            codec = "HEVC"
+            codec = "N/A"
+            resolution = "N/A"
 
-        # Get the file size in MB
-        file_size = int(run_command(f"du -m '{file_path}' | cut -f1"))
-
-        # Get the video duration in seconds
-        duration_sec = float(run_command(f"ffprobe -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 '{file_path}'"))
-        duration = "{:02}:{:02}:{:02}".format(int(duration_sec // 3600), int((duration_sec % 3600) // 60), int(duration_sec % 60))
-
-        # Calculate the overall data rate (bitrate in Mbps)
+        # Get duration and size
+        duration_sec = float(probe['format']['duration'])
+        file_size = os.path.getsize(file_path) / (1024 * 1024)  # File size in MB
+        duration = "{:02}:{:02}:{:02}".format(int(duration_sec // 3600), int((duration_sec % 3600) // 60),
+                                              int(duration_sec % 60))
         data_rate = round((file_size * 8) / duration_sec, 2) if duration_sec > 0 else "N/A"
 
-        return [full_path, filename, container, codec, resolution, data_rate, file_size, duration, total_tracks, video_tracks, audio_tracks, subtitle_tracks, chapter_tracks]
+        total_tracks = len(probe['streams'])
+        video_tracks = len(video_streams)
+        audio_tracks = len(audio_streams)
+        subtitle_tracks = len(subtitle_streams)
+        chapter_tracks = len(probe.get('chapters', []))
+
+        return [full_path, filename, container, codec, resolution, data_rate, file_size, duration, total_tracks,
+                video_tracks, audio_tracks, subtitle_tracks, chapter_tracks]
+
     except Exception as e:
         print(f"Error processing file {file_path}: {e}")
         return None
 
-# Function to process files in parallel
+
+# Function to process files in parallel with progress tracking
 def process_files_in_parallel(files):
+    total_files = len(files)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(extract_media_info, file): file for file in files}
         with open(output_file, 'w', newline='') as csvfile:
             csvwriter = csv.writer(csvfile)
             # Write header
-            csvwriter.writerow(["Full Path", "Filename", "Container", "Codec", "Resolution", "Overall Data Rate (Mbps)", "File Size (MB)", "Duration", "TotalTracks", "VideoTracks", "AudioTracks", "SubtitleTracks", "ChapterTracks"])
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    csvwriter.writerow(result)
+            csvwriter.writerow(["Full Path", "Filename", "Container", "Codec", "Resolution", "Overall Data Rate (Mbps)",
+                                "File Size (MB)", "Duration", "TotalTracks", "VideoTracks", "AudioTracks",
+                                "SubtitleTracks", "ChapterTracks"])
+
+            # Track progress using tqdm progress bar
+            with tqdm(total=total_files, desc="Processing files") as progress_bar:
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        csvwriter.writerow(result)
+                    progress_bar.update(1)  # Update progress bar for each completed file
+
 
 # Find all media files
-media_files = [os.path.join(root, file) for root, _, files in os.walk(media_dir) for file in files if file.endswith(('.mp4', '.mkv', '.avi'))]
+media_files = [os.path.join(root, file) for root, _, files in os.walk(media_dir) for file in files if
+               file.endswith(('.mp4', '.mkv', '.avi'))]
 
-# Run the parallel processing
+# Run the parallel processing with progress output
 process_files_in_parallel(media_files)
 
 print(f"CSV file created: {output_file}")
